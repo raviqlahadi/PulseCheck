@@ -11,10 +11,8 @@ const (
 	StatusUnknown Status = "UNKNOWN"
 )
 
-// Check represents a single health-check task and its result.
-type Check struct {
-	// ID is a unique identifier for this check.
-	ID string `json:"id"`
+// HealthCheck represents a single health-check task and its result.
+type HealthCheck struct {
 
 	// URL is the endpoint to be checked.
 	URL string `json:"url"`

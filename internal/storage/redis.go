@@ -4,49 +4,70 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
+	"github.com/raviqlahadi/pulsecheck/internal/config"
 	"github.com/raviqlahadi/pulsecheck/internal/domain"
+	"github.com/redis/go-redis/v9"
 )
 
 // Store defines the persistence operations for Check results.
 type Store interface {
-	Save(ctx context.Context, check domain.Check) error
-	Get(ctx context.Context, id string) (domain.Check, error)
+	SaveLatestCheck(ctx context.Context, check domain.HealthCheck) error
+	IncrementFailureCount(ctx context.Context, url string) error
+	GetLatestStatus(ctx context.Context) (map[string]domain.HealthCheck, error)
 	Close() error
 }
 
 // RedisStore is a stub Redis-backed Store.
 // Replace the field and method bodies with a real Redis client (e.g. go-redis).
 type RedisStore struct {
-	addr string
-	ttl  time.Duration
-	// client *redis.Client  // uncomment when using a real Redis client
+	client *redis.Client // uncomment when using a real Redis client
 }
 
 // NewRedisStore creates a new RedisStore.
-func NewRedisStore(addr string, ttl time.Duration) *RedisStore {
-	return &RedisStore{addr: addr, ttl: ttl}
-}
-
-// Save serialises check and writes it to Redis under the key "check:<id>".
-func (s *RedisStore) Save(_ context.Context, check domain.Check) error {
-	payload, err := json.Marshal(check)
-	if err != nil {
-		return fmt.Errorf("redis store: marshal check: %w", err)
+func NewRedisStore(cfg *config.Config) *RedisStore {
+	return &RedisStore{
+		client: redis.NewClient(&redis.Options{
+			Addr: cfg.RedisAddr,
+		}),
 	}
-	// TODO: s.client.Set(ctx, "check:"+check.ID, payload, s.ttl)
-	_ = payload
-	return nil
 }
 
-// Get retrieves a Check from Redis by its ID.
-func (s *RedisStore) Get(_ context.Context, id string) (domain.Check, error) {
-	// TODO: val, err := s.client.Get(ctx, "check:"+id).Result()
-	return domain.Check{}, fmt.Errorf("redis store: get %q: not implemented", id)
+// SaveLatestCheck updates the current status of a service in a Hash
+func (r *RedisStore) SaveLatestCheck(ctx context.Context, check domain.HealthCheck) error {
+	data, err := json.Marshal(check)
+	if err != nil {
+		return fmt.Errorf("redis store: marshal check %q: %w", check.URL, err)
+	}
+
+	return r.client.HSet(ctx, "pulsecheck:latest", check.URL, data).Err()
+}
+
+// IncrementFailureCount adds to a persistent failure counter for a specific URL
+func (r *RedisStore) IncrementFailureCount(ctx context.Context, url string) error {
+	return r.client.Incr(ctx, "pulsecheck:failures:"+url).Err()
+}
+
+// GetLatestStatus retrieves all latest checks for the dashboard
+func (r *RedisStore) GetLatestStatus(ctx context.Context) (map[string]domain.HealthCheck, error) {
+	result, err := r.client.HGetAll(ctx, "pulsecheck:latest").Result()
+	if err != nil {
+		return nil, fmt.Errorf("redis store: get latest status: %w", err)
+	}
+
+	checks := make(map[string]domain.HealthCheck)
+	for url, data := range result {
+		var check domain.HealthCheck
+		if err := json.Unmarshal([]byte(data), &check); err != nil {
+			return nil, fmt.Errorf("redis store: unmarshal check for url %q: %w", url, err)
+		}
+		checks[url] = check
+	}
+
+	return checks, nil
 }
 
 // Close releases the Redis connection pool.
-func (s *RedisStore) Close() error {
-	return nil
+func (r *RedisStore) Close() error {
+	return r.client.Close()
 }

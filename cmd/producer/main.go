@@ -3,21 +3,21 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/raviqlahadi/pulsecheck/internal/config"
 	"github.com/raviqlahadi/pulsecheck/internal/domain"
 	"github.com/raviqlahadi/pulsecheck/internal/transport"
 )
 
 func main() {
-	brokers := envOrDefault("KAFKA_BROKERS", "localhost:9092")
-	topic := envOrDefault("KAFKA_TOPIC", "pulse-checks")
+	cfg := config.Load()
 
-	producer := transport.NewKafkaProducer(strings.Split(brokers, ","), topic)
+	producer := transport.NewKafkaProducer(cfg.KafkaBrokers, cfg.KafkaTopic)
 	defer func() {
 		if err := producer.Close(); err != nil {
 			log.Printf("producer close: %v", err)
@@ -27,33 +27,60 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("producer started (brokers=%s topic=%s)", brokers, topic)
+	log.Printf("Producer started. Broking to: %v | Topic: %s", cfg.KafkaBrokers, cfg.KafkaTopic)
 
-	ticker := time.NewTicker(30 * time.Second)
+	urls := []string{
+		"https://google.com",
+		"https://github.com",
+		"https://go.dev",
+	}
+
+	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("producer shutting down")
+			log.Println("Producer shutting down...")
 			return
 		case <-ticker.C:
-			check := domain.Check{
-				ID:  "example-check",
-				URL: "https://example.com",
-			}
-			if err := producer.Publish(ctx, check); err != nil {
-				log.Printf("publish error: %v", err)
-			} else {
-				log.Printf("published check id=%s url=%s", check.ID, check.URL)
+			for _, url := range urls {
+				check := pingURL(url)
+				if err := producer.Publish(ctx, check); err != nil {
+					log.Printf("Publish error for %s: %v", url, err)
+				} else {
+					log.Printf("[%s] Status: %s | Latency: %dms", check.URL, check.Status, check.ResponseTimeMs)
+				}
 			}
 		}
 	}
+
 }
 
-func envOrDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+func pingURL(url string) domain.HealthCheck {
+	start := time.Now()
+
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	duration := time.Since(start).Microseconds()
+	check := domain.HealthCheck{
+		URL:            url,
+		CheckedAt:      time.Now(),
+		ResponseTimeMs: duration,
+		Status:         domain.StatusDown,
 	}
-	return def
+
+	if err != nil {
+		check.Error = err.Error()
+		return check
+	}
+
+	defer resp.Body.Close()
+
+	check.StatusCode = resp.StatusCode
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		check.Status = domain.StatusUp
+	}
+
+	return check
 }

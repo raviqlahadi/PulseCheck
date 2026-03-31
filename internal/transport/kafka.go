@@ -4,71 +4,97 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/raviqlahadi/pulsecheck/internal/domain"
+	"github.com/segmentio/kafka-go"
 )
 
 // Producer publishes Check messages to a Kafka topic.
 type Producer interface {
-	Publish(ctx context.Context, check domain.Check) error
+	Publish(ctx context.Context, check domain.HealthCheck) error
 	Close() error
 }
 
 // Consumer reads Check messages from a Kafka topic.
 type Consumer interface {
-	Subscribe(ctx context.Context, handler func(check domain.Check) error) error
+	Subscribe(ctx context.Context, handler func(check domain.HealthCheck) error) error
 	Close() error
 }
 
-// KafkaProducer is a stub Kafka producer that satisfies the Producer interface.
-// Replace the body of Publish with a real Kafka client (e.g. franz-go or confluent-kafka-go).
+// KafkaProducer is a stub Kafka producer.
 type KafkaProducer struct {
-	brokers []string
-	topic   string
+	writer *kafka.Writer
 }
 
-// NewKafkaProducer creates a new KafkaProducer.
 func NewKafkaProducer(brokers []string, topic string) *KafkaProducer {
-	return &KafkaProducer{brokers: brokers, topic: topic}
+	return &KafkaProducer{
+		writer: &kafka.Writer{
+			Addr:     kafka.TCP(brokers...),
+			Topic:    topic,
+			Balancer: &kafka.LeastBytes{},
+		},
+	}
 }
 
-// Publish serialises check and sends it to the configured Kafka topic.
-func (p *KafkaProducer) Publish(_ context.Context, check domain.Check) error {
+func (p *KafkaProducer) Publish(ctx context.Context, check domain.HealthCheck) error {
 	payload, err := json.Marshal(check)
 	if err != nil {
-		return fmt.Errorf("kafka producer: marshal check: %w", err)
+		return err
 	}
-	// TODO: send payload to Kafka topic p.topic using a real client.
-	_ = payload
-	return nil
+
+	return p.writer.WriteMessages(ctx, kafka.Message{
+		Key:   []byte(check.URL), // Use URL as the key for partitioning
+		Value: payload,
+	})
 }
 
-// Close releases any resources held by the producer.
 func (p *KafkaProducer) Close() error {
-	return nil
+	return p.writer.Close()
 }
 
-// KafkaConsumer is a stub Kafka consumer that satisfies the Consumer interface.
-// Replace the body of Subscribe with a real Kafka client.
+// KafkaConsumer is a stub Kafka consumer.
 type KafkaConsumer struct {
-	brokers []string
-	topic   string
-	groupID string
+	reader *kafka.Reader
 }
 
-// NewKafkaConsumer creates a new KafkaConsumer.
-func NewKafkaConsumer(brokers []string, topic, groupID string) *KafkaConsumer {
-	return &KafkaConsumer{brokers: brokers, topic: topic, groupID: groupID}
+func NewKafkaConsumer(brokers []string, topic string, groupID string) *KafkaConsumer {
+	return &KafkaConsumer{
+		reader: kafka.NewReader(kafka.ReaderConfig{
+			Brokers:     brokers,
+			Topic:       topic,
+			GroupID:     groupID,
+			StartOffset: kafka.FirstOffset,
+			// Optional: add a small wait to avoid aggressive CPU usage on empty topics
+			MaxWait: 1 * time.Second,
+		}),
+	}
 }
 
-// Subscribe begins consuming messages from the topic, calling handler for each one.
-func (c *KafkaConsumer) Subscribe(ctx context.Context, handler func(domain.Check) error) error {
-	// TODO: poll messages from Kafka using a real client and call handler for each.
-	<-ctx.Done()
-	return ctx.Err()
+func (c *KafkaConsumer) Subscribe(ctx context.Context, handler func(check domain.HealthCheck) error) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			m, err := c.reader.ReadMessage(ctx)
+			if err != nil {
+				return fmt.Errorf("kafka consumer: read: %w", err)
+			}
+
+			var check domain.HealthCheck
+			if err := json.Unmarshal(m.Value, &check); err != nil {
+				continue // Skip malformed messages
+			}
+
+			if err := handler(check); err != nil {
+				fmt.Printf("Handler error: %v\n", err)
+			}
+		}
+	}
+
 }
 
-// Close releases any resources held by the consumer.
 func (c *KafkaConsumer) Close() error {
-	return nil
+	return c.reader.Close()
 }

@@ -5,59 +5,54 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
-	"time"
 
+	"github.com/raviqlahadi/pulsecheck/internal/config"
 	"github.com/raviqlahadi/pulsecheck/internal/domain"
 	"github.com/raviqlahadi/pulsecheck/internal/storage"
 	"github.com/raviqlahadi/pulsecheck/internal/transport"
 )
 
 func main() {
-	brokers := envOrDefault("KAFKA_BROKERS", "localhost:9092")
-	topic := envOrDefault("KAFKA_TOPIC", "pulse-checks")
-	groupID := envOrDefault("KAFKA_GROUP_ID", "pulsecheck-consumer")
-	redisAddr := envOrDefault("REDIS_ADDR", "localhost:6379")
-	redisTTL := 24 * time.Hour
+	cfg := config.Load()
 
-	consumer := transport.NewKafkaConsumer(strings.Split(brokers, ","), topic, groupID)
+	repo := storage.NewRedisStore(cfg)
+	log.Printf("Connected to Redis at %s", cfg.RedisAddr)
+
+	consumer := transport.NewKafkaConsumer(cfg.KafkaBrokers, cfg.KafkaTopic, "pulsecheck-consumers")
 	defer func() {
 		if err := consumer.Close(); err != nil {
-			log.Printf("consumer close: %v", err)
-		}
-	}()
-
-	store := storage.NewRedisStore(redisAddr, redisTTL)
-	defer func() {
-		if err := store.Close(); err != nil {
-			log.Printf("store close: %v", err)
+			log.Printf("Consumer close error: %v", err)
 		}
 	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("consumer started (brokers=%s topic=%s group=%s redis=%s)",
-		brokers, topic, groupID, redisAddr)
+	log.Printf("Consumer started. Listening to: %v | Topic: %s", cfg.KafkaBrokers, cfg.KafkaTopic)
 
-	if err := consumer.Subscribe(ctx, func(check domain.Check) error {
-		if err := store.Save(ctx, check); err != nil {
-			log.Printf("store save error: %v", err)
+	handler := func(check domain.HealthCheck) error {
+		if err := repo.SaveLatestCheck(ctx, check); err != nil {
 			return err
 		}
-		log.Printf("stored check id=%s url=%s status=%s", check.ID, check.URL, check.Status)
+
+		if check.Status == domain.StatusDown {
+			if err := repo.IncrementFailureCount(ctx, check.URL); err != nil {
+				log.Printf("Failed to increment failure for %s: %v", check.URL, err)
+			}
+			log.Printf("ALERT: %s is DOWN (Status: %d)", check.URL, check.StatusCode)
+		} else {
+			log.Printf("OK: %s (%dms)", check.URL, check.ResponseTimeMs)
+		}
+
 		return nil
-	}); err != nil && err != context.Canceled {
-		log.Printf("consumer error: %v", err)
 	}
 
-	log.Println("consumer shutting down")
-}
-
-func envOrDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if err := consumer.Subscribe(ctx, handler); err != nil {
+		if err == context.Canceled {
+			log.Printf("Consumer shutting down gracefully...")
+		} else {
+			log.Fatalf("Consumer loop error: %v", err)
+		}
 	}
-	return def
 }
